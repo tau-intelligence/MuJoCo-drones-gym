@@ -465,6 +465,15 @@ class BaseAviary(gym.Env):
         self._renderer = None
         self._viewer = None
 
+        # Optional shared-renderer delegation (see multi_drone_mujoco.rendering).
+        # When set, _getDroneImages() renders through this object instead of
+        # creating a per-env GL context. Only valid for static worlds -- the
+        # caller asserts that, it is never inferred. None => original behaviour.
+        self._external_renderer = None
+        # Segmentation is rendered by default for backward compatibility, but it
+        # is a full extra render pass and callers that discard it can opt out.
+        self._render_seg = True
+
         # Wind disturbance (set via set_wind() or subclass)
         self._wind_field = None
 
@@ -809,10 +818,17 @@ class BaseAviary(gym.Env):
         ]).reshape(20,)
 
     def _getDroneImages(self, nth_drone):
-        """Render RGB, depth, and segmentation from the nth drone's camera."""
-        if self._renderer is None:
-            self._renderer = mujoco.Renderer(self.model, height=self.IMG_RES[1], width=self.IMG_RES[0])
+        """Render RGB, depth, and segmentation from the nth drone's camera.
 
+        Three behaviours, in priority order:
+
+        1. ``self._external_renderer`` set -> delegate to a shared renderer
+           (one GL context serving many envs). Static worlds only.
+        2. ``self._render_seg`` False -> skip the segmentation render pass and
+           return a zero segmentation buffer. Saves a full pass for callers
+           that discard it.
+        3. otherwise -> original per-env behaviour, unchanged.
+        """
         cam_name = f"drone{nth_drone}_cam"
         cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
         if cam_id < 0:
@@ -820,20 +836,31 @@ class BaseAviary(gym.Env):
                     np.ones((self.IMG_RES[1], self.IMG_RES[0]), dtype=np.float32),
                     np.zeros((self.IMG_RES[1], self.IMG_RES[0]), dtype=np.int32))
 
+        if self._external_renderer is not None:
+            return self._external_renderer.render(
+                self.data, cam_name, want_seg=self._render_seg)
+
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self.model, height=self.IMG_RES[1], width=self.IMG_RES[0])
+
         self._renderer.update_scene(self.data, camera=cam_name)
         rgb = self._renderer.render()
 
-        # Depth rendering
+        # Depth rendering. The update_scene here looks redundant (same data,
+        # unchanged) -- bench/baseline.py measures what dropping it would save,
+        # but it stays until a pixel test proves depth is unaffected.
         self._renderer.enable_depth_rendering()
         self._renderer.update_scene(self.data, camera=cam_name)
         dep = self._renderer.render()
         self._renderer.disable_depth_rendering()
 
-        # Segmentation rendering
-        self._renderer.enable_segmentation_rendering()
-        self._renderer.update_scene(self.data, camera=cam_name)
-        seg = self._renderer.render()
-        self._renderer.disable_segmentation_rendering()
+        if self._render_seg:
+            self._renderer.enable_segmentation_rendering()
+            self._renderer.update_scene(self.data, camera=cam_name)
+            seg = self._renderer.render()
+            self._renderer.disable_segmentation_rendering()
+        else:
+            seg = np.zeros((self.IMG_RES[1], self.IMG_RES[0]), dtype=np.int32)
 
         return rgb, dep, seg
 
