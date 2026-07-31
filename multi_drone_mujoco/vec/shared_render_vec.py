@@ -23,6 +23,7 @@ Only valid for identical static worlds -- see multi_drone_mujoco.rendering.
 from __future__ import annotations
 
 import multiprocessing as mp
+import traceback
 from collections import OrderedDict
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
@@ -77,14 +78,28 @@ def _split_indices(n_envs: int, n_workers: int) -> List[List[int]]:
 
 def _worker(remote, parent_remote, env_fns_wrapper, want_seg: bool,
             state_transfer: str) -> None:
-    parent_remote.close()
-    env_fns = env_fns_wrapper.var
-    envs = [fn() for fn in env_fns]
+    """Serve one group of envs.
 
-    # One renderer for this whole group. Built after the envs so it can adopt
-    # their model and validate compatibility.
+    Every reply is tagged ``("ok", payload)`` or ``("error", traceback)``. Without
+    that, any exception here would kill the worker silently and leave the parent
+    blocked forever in ``recv()`` -- a hang instead of an error, which is far
+    harder to diagnose than a crash.
+    """
+    parent_remote.close()
+    envs = []
     renderer: Optional[SharedStaticRenderer] = None
+
+    def _fail():
+        try:
+            remote.send(("error", traceback.format_exc()))
+        except Exception:
+            pass
+
+    # Setup is the most likely place to fail (bad model, no GL context, OOM),
+    # and it happens before the parent has asked for anything -- so it needs its
+    # own guard.
     try:
+        envs = [fn() for fn in env_fns_wrapper.var]
         head = envs[0]
         renderer = SharedStaticRenderer(
             head.model,
@@ -97,9 +112,21 @@ def _worker(remote, parent_remote, env_fns_wrapper, want_seg: bool,
             renderer.assert_compatible(e.model, "drone0_cam")
             e._external_renderer = renderer
             e._render_seg = want_seg
+    except Exception:
+        _fail()
+        for e in envs:
+            try:
+                e.close()
+            except Exception:
+                pass
+        return
 
+    try:
         while True:
-            cmd, data = remote.recv()
+            try:
+                cmd, data = remote.recv()
+            except (EOFError, KeyboardInterrupt):
+                break
 
             if cmd == "step":
                 results = []
@@ -112,17 +139,17 @@ def _worker(remote, parent_remote, env_fns_wrapper, want_seg: bool,
                         obs, reset_info = env.reset()
                         info["reset_info"] = reset_info
                     results.append((obs, reward, done, info))
-                remote.send(results)
+                remote.send(("ok", results))
 
             elif cmd == "reset":
                 out = []
                 for env, (seed, options) in zip(envs, data):
                     obs, reset_info = env.reset(seed=seed, options=options)
                     out.append((obs, reset_info))
-                remote.send(out)
+                remote.send(("ok", out))
 
             elif cmd == "render":
-                remote.send([env.render() for env in envs])
+                remote.send(("ok", [env.render() for env in envs]))
 
             elif cmd == "close":
                 for env in envs:
@@ -133,32 +160,35 @@ def _worker(remote, parent_remote, env_fns_wrapper, want_seg: bool,
                 break
 
             elif cmd == "get_spaces":
-                remote.send((envs[0].observation_space, envs[0].action_space))
+                remote.send(("ok", (envs[0].observation_space, envs[0].action_space)))
 
             elif cmd == "get_attr":
-                remote.send([getattr(env, data) for env in envs])
+                remote.send(("ok", [getattr(env, data) for env in envs]))
 
             elif cmd == "set_attr":
                 for env in envs:
                     setattr(env, data[0], data[1])
-                remote.send([None] * len(envs))
+                remote.send(("ok", [None] * len(envs)))
 
             elif cmd == "env_method":
                 name, args, kwargs = data
-                remote.send([getattr(env, name)(*args, **kwargs) for env in envs])
+                remote.send(("ok", [getattr(env, name)(*args, **kwargs) for env in envs]))
 
             elif cmd == "is_wrapped":
                 from stable_baselines3.common import env_util
-                remote.send([env_util.is_wrapped(env, data) for env in envs])
+                remote.send(("ok", [env_util.is_wrapped(env, data) for env in envs]))
 
             elif cmd == "render_stats":
-                remote.send(renderer.stats.as_dict() if renderer else None)
+                remote.send(("ok", renderer.stats.as_dict() if renderer else None))
 
             else:
                 raise NotImplementedError(f"worker: unknown command {cmd}")
 
     except (KeyboardInterrupt, EOFError):
         pass
+    except Exception:
+        # Report rather than die mute, so the parent raises instead of hanging.
+        _fail()
     finally:
         try:
             if renderer is not None:
@@ -226,8 +256,27 @@ class SharedRenderVecEnv(VecEnv):
             work_remote.close()
 
         self.remotes[0].send(("get_spaces", None))
-        observation_space, action_space = self.remotes[0].recv()
+        observation_space, action_space = self._recv(self.remotes[0])
         super().__init__(n_envs, observation_space, action_space)
+
+    @staticmethod
+    def _recv(remote):
+        """Unwrap a worker reply, surfacing worker-side failures as exceptions.
+
+        Without this a crashed worker would leave the parent blocked in recv()
+        forever; here it raises with the child's traceback attached.
+        """
+        try:
+            tag, payload = remote.recv()
+        except EOFError as exc:
+            raise RuntimeError(
+                "SharedRenderVecEnv: a worker exited before replying. It most "
+                "likely failed while building its envs or GL context."
+            ) from exc
+        if tag == "error":
+            raise RuntimeError(
+                "SharedRenderVecEnv: worker raised:\n\n" + str(payload))
+        return payload
 
     # -- stepping ----------------------------------------------------------
 
@@ -237,7 +286,7 @@ class SharedRenderVecEnv(VecEnv):
         self.waiting = True
 
     def step_wait(self) -> VecEnvStepReturn:
-        per_worker = [remote.recv() for remote in self.remotes]
+        per_worker = [self._recv(remote) for remote in self.remotes]
         self.waiting = False
 
         # Flatten back into env order. Groups are contiguous and in order, so
@@ -253,7 +302,7 @@ class SharedRenderVecEnv(VecEnv):
         for remote, group in zip(self.remotes, self.groups):
             payload = [(self._seeds[i], self._options[i]) for i in group]
             remote.send(("reset", payload))
-        per_worker = [remote.recv() for remote in self.remotes]
+        per_worker = [self._recv(remote) for remote in self.remotes]
         results = [r for chunk in per_worker for r in chunk]
         obs = [o for o, _ in results]
         self.reset_infos = [info for _, info in results]
@@ -300,7 +349,7 @@ class SharedRenderVecEnv(VecEnv):
         for remote, _ in targets:
             if id(remote) not in cache:
                 remote.send(("get_attr", attr_name))
-                cache[id(remote)] = remote.recv()
+                cache[id(remote)] = self._recv(remote)
         return [cache[id(remote)][slot] for remote, slot in targets]
 
     def set_attr(self, attr_name: str, value: Any, indices: VecEnvIndices = None) -> None:
@@ -308,7 +357,7 @@ class SharedRenderVecEnv(VecEnv):
         for remote, _ in self._remotes_for(indices):
             if id(remote) not in seen:
                 remote.send(("set_attr", (attr_name, value)))
-                remote.recv()
+                self._recv(remote)
                 seen.add(id(remote))
 
     def env_method(self, method_name: str, *method_args,
@@ -318,7 +367,7 @@ class SharedRenderVecEnv(VecEnv):
         for remote, _ in targets:
             if id(remote) not in cache:
                 remote.send(("env_method", (method_name, method_args, method_kwargs)))
-                cache[id(remote)] = remote.recv()
+                cache[id(remote)] = self._recv(remote)
         return [cache[id(remote)][slot] for remote, slot in targets]
 
     def env_is_wrapped(self, wrapper_class, indices: VecEnvIndices = None) -> List[bool]:
@@ -327,7 +376,7 @@ class SharedRenderVecEnv(VecEnv):
         for remote, _ in targets:
             if id(remote) not in cache:
                 remote.send(("is_wrapped", wrapper_class))
-                cache[id(remote)] = remote.recv()
+                cache[id(remote)] = self._recv(remote)
         return [cache[id(remote)][slot] for remote, slot in targets]
 
     # -- diagnostics -------------------------------------------------------
@@ -336,4 +385,4 @@ class SharedRenderVecEnv(VecEnv):
         """Per-worker renderer timings -- frames, raster ms, p99, fps."""
         for remote in self.remotes:
             remote.send(("render_stats", None))
-        return [remote.recv() for remote in self.remotes]
+        return [self._recv(remote) for remote in self.remotes]

@@ -99,7 +99,6 @@ class SharedStaticRenderer:
         # Scratch data used only for rendering. Never stepped -- it holds a
         # configuration copied from an env, not an independent simulation.
         self._scratch = mujoco.MjData(model)
-        self._zero_seg = np.zeros((self.height, self.width), dtype=np.int32)
 
         self.stats = RenderStats()
 
@@ -175,7 +174,9 @@ class SharedStaticRenderer:
             seg = self._renderer.render()
             self._renderer.disable_segmentation_rendering()
         else:
-            seg = self._zero_seg
+            # Freshly allocated, matching BaseAviary's per-env path. Handing the
+            # same array to every env would alias across them.
+            seg = np.zeros((self.height, self.width), dtype=np.int32)
 
         t2 = time.perf_counter()
 
