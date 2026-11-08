@@ -12,12 +12,22 @@ from pathlib import Path
 import numpy as np
 
 
+def _tb_log_dir(output_dir: str):
+    """Return a tensorboard log dir, or None if tensorboard is not installed."""
+    try:
+        import tensorboard  # noqa: F401
+    except ImportError:
+        return None
+    return os.path.join(output_dir, "tb")
+
+
 def train_single(total_timesteps: int = 100_000, output_dir: str = "results/rl_hover"):
     """Train single-drone hover with PPO."""
     try:
         from stable_baselines3 import PPO
         from stable_baselines3.common.env_util import make_vec_env
         from stable_baselines3.common.callbacks import EvalCallback
+        from stable_baselines3.common.monitor import Monitor
     except ImportError:
         print("[ERROR] stable-baselines3 not installed. Run: pip install stable-baselines3")
         return
@@ -37,7 +47,7 @@ def train_single(total_timesteps: int = 100_000, output_dir: str = "results/rl_h
         n_envs=4,
     )
 
-    eval_env = HoverAviary(ctrl_freq=48, sim_freq=240)
+    eval_env = Monitor(HoverAviary(ctrl_freq=48, sim_freq=240))
 
     eval_callback = EvalCallback(
         eval_env,
@@ -51,7 +61,7 @@ def train_single(total_timesteps: int = 100_000, output_dir: str = "results/rl_h
         "MlpPolicy",
         env,
         verbose=1,
-        tensorboard_log=os.path.join(output_dir, "tb"),
+        tensorboard_log=_tb_log_dir(output_dir),
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,
@@ -76,6 +86,7 @@ def train_multi(total_timesteps: int = 200_000, output_dir: str = "results/rl_mu
         from stable_baselines3 import PPO
         from stable_baselines3.common.env_util import make_vec_env
         from stable_baselines3.common.callbacks import EvalCallback
+        from stable_baselines3.common.monitor import Monitor
     except ImportError:
         print("[ERROR] stable-baselines3 not installed. Run: pip install stable-baselines3")
         return
@@ -99,12 +110,12 @@ def train_multi(total_timesteps: int = 200_000, output_dir: str = "results/rl_mu
         n_envs=4,
     )
 
-    eval_env = MultiHoverAviary(
+    eval_env = Monitor(MultiHoverAviary(
         num_drones=2,
         ctrl_freq=48,
         sim_freq=240,
         target_heights=[1.2, 0.7],
-    )
+    ))
 
     eval_callback = EvalCallback(
         eval_env,
@@ -118,7 +129,7 @@ def train_multi(total_timesteps: int = 200_000, output_dir: str = "results/rl_mu
         "MlpPolicy",
         env,
         verbose=1,
-        tensorboard_log=os.path.join(output_dir, "tb"),
+        tensorboard_log=_tb_log_dir(output_dir),
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,

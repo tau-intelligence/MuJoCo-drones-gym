@@ -48,6 +48,17 @@ class HoverAviary(BaseAviary):
             render_mode=render_mode,
         )
 
+    # Fraction of HOVER_RPM that a full-scale action (+/-1) adds or removes.
+    # Matches gym-pybullet-drones' ActionType.RPM convention: a zero action is
+    # exactly hover thrust, and the policy only learns small corrections.
+    ACTION_RPM_SCALE = 0.05
+
+    # Episode is terminated (failure) when the drone leaves this box or tilts
+    # past this angle. These are unrecoverable states for a hover policy.
+    MAX_XY = 1.5
+    MAX_Z = 2.0
+    MAX_TILT = 0.4  # rad
+
     def _actionSpace(self):
         """Normalized [-1, 1] → mapped to RPM internally."""
         return spaces.Box(low=-np.ones(4, dtype=np.float32), high=np.ones(4, dtype=np.float32))
@@ -60,10 +71,15 @@ class HoverAviary(BaseAviary):
         )
 
     def _preprocessAction(self, action):
-        """Convert normalized action to RPMs."""
-        action = np.clip(np.array(action).flatten(), -1, 1)
-        rpms = self._normalizedActionToRPM(action).reshape(1, 4)
-        return rpms
+        """Convert normalized action to RPMs centred on hover.
+
+        ``rpm = HOVER_RPM * (1 + ACTION_RPM_SCALE * action)``. The previous
+        mapping spanned the full [0, MAX_RPM] range, so tiny policy outputs
+        produced huge thrust changes and PPO could not discover hovering.
+        """
+        action = np.clip(np.array(action, dtype=np.float64).flatten(), -1, 1)
+        rpms = self.HOVER_RPM * (1.0 + self.ACTION_RPM_SCALE * action)
+        return np.clip(rpms, 0, self.MAX_RPM).reshape(1, 4)
 
     def _computeObs(self):
         """12-dim observation."""
@@ -73,40 +89,40 @@ class HoverAviary(BaseAviary):
         return obs.astype(np.float32)
 
     def _computeReward(self):
-        """Dense reward: penalize distance to target height and attitude."""
+        """Dense, strictly non-negative reward.
+
+        The previous reward was negative at every step (starting 0.9 m below
+        the target) while crashing cost only a one-off -100. Ending the episode
+        early was therefore the return-maximising strategy, and PPO learned to
+        fly out of the bounds as fast as possible. With a non-negative reward
+        every extra step alive is worth something, so termination is never
+        attractive and no explicit crash penalty is needed.
+        """
         state = self._getDroneStateVector(0)
         pos = state[0:3]
         vel = state[10:13]
         rpy = state[7:10]
 
-        # Reward for being at target height
-        height_error = abs(pos[2] - self.TARGET_HEIGHT)
-        xy_error = np.linalg.norm(pos[0:2])
+        target = np.array([0.0, 0.0, self.TARGET_HEIGHT])
+        dist = np.linalg.norm(target - pos)
 
-        reward = -height_error - 0.1 * xy_error
-        reward -= 0.05 * np.linalg.norm(vel)
-        reward -= 0.05 * (abs(rpy[0]) + abs(rpy[1]))
-
-        # Bonus for being close
-        if height_error < 0.05 and xy_error < 0.05:
-            reward += 1.0
-
-        if self._computeTerminated():
-            reward -= 100.0
-
-        return float(reward)
+        reward = max(0.0, 2.0 - dist ** 4)               # in [0, 2]
+        reward += 0.5 * np.exp(-5.0 * dist)               # sharpen near target
+        reward -= 0.05 * min(np.linalg.norm(vel), 4.0)    # bounded damping terms
+        reward -= 0.05 * min(abs(rpy[0]) + abs(rpy[1]), 2.0)
+        return float(max(reward, 0.0))
 
     def _computeTerminated(self):
-        """Terminate if drone crashes or flips."""
+        """Terminate if the drone crashes, flips, or leaves the flight box."""
         state = self._getDroneStateVector(0)
         pos = state[0:3]
         rpy = state[7:10]
 
-        if pos[2] < 0.0:
+        if pos[2] < 0.0 or pos[2] > self.MAX_Z:
             return True
-        if abs(rpy[0]) > np.pi / 2 or abs(rpy[1]) > np.pi / 2:
+        if abs(pos[0]) > self.MAX_XY or abs(pos[1]) > self.MAX_XY:
             return True
-        if pos[2] > 3.0:
+        if abs(rpy[0]) > self.MAX_TILT or abs(rpy[1]) > self.MAX_TILT:
             return True
         return False
 
