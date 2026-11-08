@@ -70,12 +70,16 @@ class MultiHoverAviary(BaseAviary):
             dtype=np.float32,
         )
 
+    # See HoverAviary: zero action == hover thrust, +/-1 == +/-5% RPM.
+    ACTION_RPM_SCALE = 0.05
+    MAX_XY_DRIFT = 1.5
+    MAX_Z = 2.0
+    MAX_TILT = 0.4  # rad
+
     def _preprocessAction(self, action):
-        action = np.clip(np.array(action).reshape(self.NUM_DRONES, 4), -1, 1)
-        rpms = np.zeros((self.NUM_DRONES, 4))
-        for i in range(self.NUM_DRONES):
-            rpms[i] = self._normalizedActionToRPM(action[i])
-        return rpms
+        action = np.clip(np.array(action, dtype=np.float64).reshape(self.NUM_DRONES, 4), -1, 1)
+        rpms = self.HOVER_RPM * (1.0 + self.ACTION_RPM_SCALE * action)
+        return np.clip(rpms, 0, self.MAX_RPM)
 
     def _computeObs(self):
         obs_list = []
@@ -89,25 +93,28 @@ class MultiHoverAviary(BaseAviary):
         return np.concatenate(obs_list).astype(np.float32)
 
     def _computeReward(self):
+        """Non-negative per-drone reward (see HoverAviary._computeReward).
+
+        A negative per-step reward combined with a one-off crash penalty makes
+        early termination the optimal strategy, so the reward is kept >= 0.
+        """
         total = 0.0
         for i in range(self.NUM_DRONES):
-            height_err = abs(self.pos[i, 2] - self.TARGET_HEIGHTS[i])
-            xy_err = np.linalg.norm(self.pos[i, 0:2] - self.INIT_XYZS[i, 0:2])
-            total += -height_err - 0.1 * xy_err
-            total -= 0.05 * (abs(self.rpy[i, 0]) + abs(self.rpy[i, 1]))
-            if height_err < 0.05:
-                total += 0.5
-                
-        if self._computeTerminated():
-            total -= 100.0
-            
-        return float(total)
+            target = np.array([self.INIT_XYZS[i, 0], self.INIT_XYZS[i, 1], self.TARGET_HEIGHTS[i]])
+            dist = np.linalg.norm(target - self.pos[i])
+            r = max(0.0, 2.0 - dist ** 4) + 0.5 * np.exp(-5.0 * dist)
+            r -= 0.05 * min(np.linalg.norm(self.vel[i]), 4.0)
+            r -= 0.05 * min(abs(self.rpy[i, 0]) + abs(self.rpy[i, 1]), 2.0)
+            total += max(r, 0.0)
+        return float(total / self.NUM_DRONES)
 
     def _computeTerminated(self):
         for i in range(self.NUM_DRONES):
-            if self.pos[i, 2] < 0.0:
+            if self.pos[i, 2] < 0.0 or self.pos[i, 2] > self.MAX_Z:
                 return True
-            if abs(self.rpy[i, 0]) > np.pi / 2 or abs(self.rpy[i, 1]) > np.pi / 2:
+            if np.any(np.abs(self.pos[i, 0:2] - self.INIT_XYZS[i, 0:2]) > self.MAX_XY_DRIFT):
+                return True
+            if abs(self.rpy[i, 0]) > self.MAX_TILT or abs(self.rpy[i, 1]) > self.MAX_TILT:
                 return True
         return False
 
